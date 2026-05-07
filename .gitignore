@@ -1,0 +1,35 @@
+# Sensitive input/output data
+entrada/
+saida/
+validacao/
+validação/
+
+# Optional legacy OCR bundle not required by the current solution
+OCR/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Workbook / PDF data outside the ignored folders
+*.pdf
+*.xls
+*.xlsx
+*.xlsm
