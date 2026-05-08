@@ -3,6 +3,8 @@ import unittest
 from leitor_pdf import (
     PaymentComponent,
     align_payment_sequences,
+    build_output_row,
+    build_precatorio_number,
     extract_payment_types,
     extract_process_id,
     join_name_fragments,
@@ -32,6 +34,16 @@ class LeitorPdfRulesTest(unittest.TestCase):
                 "Cessão - Acordo Direto",
             ],
         )
+
+    def test_build_precatorio_number_applies_business_rule(self) -> None:
+        self.assertEqual(build_precatorio_number("201900120859"), "12085919")
+        self.assertEqual(build_precatorio_number("202000131717"), "13171720")
+        self.assertEqual(build_precatorio_number("201700115823"), "11582317")
+
+    def test_build_precatorio_number_returns_empty_for_invalid_process(self) -> None:
+        self.assertEqual(build_precatorio_number(""), "")
+        self.assertEqual(build_precatorio_number("20190012085"), "")
+        self.assertEqual(build_precatorio_number("2019A0120859"), "")
 
     def test_align_payment_sequences_discards_duplicate_tail(self) -> None:
         payment_types = [
@@ -132,6 +144,27 @@ class LeitorPdfRulesTest(unittest.TestCase):
             join_name_fragments(record, "DOS"),
             "ANNE GRAZIELLY DOS SANTOS MELO REP POR SUA GENITORA MARIA ROSANGELA DOS SANTOS- HERDEIRA DE JOSE DELFINO DE MELO",
         )
+
+    def test_build_output_row_fills_precatorio_from_process(self) -> None:
+        record = {
+            "processo": ["201900120859"],
+            "credor": ["CREDOR EXEMPLO"],
+            "entidade": ["ENTE EXEMPLO"],
+            "data_pagamento": ["15/04/2024"],
+            "tipo_pagamento": ["Pagamento Integral"],
+            "tipo_antecipacao": [],
+            "valor_bruto": ["1.000,00"],
+            "previdencia": [],
+            "imposto_renda": [],
+            "bloqueio": [],
+            "valor_liquido": ["900,00"],
+            "__name_segments__": ["CREDOR EXEMPLO"],
+        }
+
+        built_row = build_output_row(record)
+
+        self.assertEqual(built_row.row["Nº do processo"], "201900120859")
+        self.assertEqual(built_row.row["Nº precatorio"], "12085919")
 
 
 if __name__ == "__main__":

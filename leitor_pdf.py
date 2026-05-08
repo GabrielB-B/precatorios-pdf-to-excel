@@ -165,6 +165,12 @@ def extract_process_id(text: str) -> tuple[str, str]:
     return process_id, remainder
 
 
+def build_precatorio_number(process_id: str) -> str:
+    if not re.fullmatch(r"\d{12}", process_id):
+        return ""
+    return f"{process_id[6:]}{process_id[2:4]}"
+
+
 def canonical_payment_name(normalized_match: str) -> str:
     if normalized_match.startswith("PARCIAL"):
         return "Parcial Antecipação"
@@ -429,7 +435,7 @@ def build_output_row(record: dict[str, list[str]]) -> BuiltRow:
     row = {
         "Elaborador": "",
         "Nº do processo": process_id,
-        "Nº precatorio": "",
+        "Nº precatorio": build_precatorio_number(process_id),
         "Nome do Credor": join_name_fragments(record, process_remainder),
         "Entidade/Ente Federado": join_entity_fragments(record),
         "Data pagamento": payment_date,

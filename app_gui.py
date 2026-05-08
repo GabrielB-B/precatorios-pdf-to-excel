@@ -6,36 +6,38 @@ import subprocess
 import sys
 import threading
 import traceback
-import unicodedata
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+from PIL import Image, ImageTk
+
 from leitor_pdf import run_extraction
-from validar_planilhas import run_validation
 
 
 APP_TITLE = "Extrator de Precatórios"
 APP_ID = "gabriel.bispo.extrator.precatorios"
+BRAND_ICON_SIZE = 118
+WINDOW_ICON_SIZES = (256, 128, 64, 48, 32, 16)
 
 COLORS = {
-    "ink": "#0f1a24",
-    "ink_soft": "#162534",
-    "ink_panel": "#1a2d40",
-    "paper": "#f4efe5",
-    "paper_soft": "#efe5d3",
-    "paper_line": "#d9c9ac",
-    "text_dark": "#172331",
-    "text_soft": "#516274",
+    "ink": "#101b25",
+    "ink_soft": "#182635",
+    "ink_panel": "#1e3143",
+    "paper": "#f5efe4",
+    "paper_soft": "#efe3cc",
+    "paper_panel": "#fbf7ef",
+    "paper_line": "#d8c7aa",
+    "text_dark": "#152230",
+    "text_soft": "#5b6a78",
     "gold": "#c79734",
-    "gold_soft": "#f1d697",
-    "olive": "#68735f",
+    "gold_soft": "#f0d79d",
     "success": "#2c7a5a",
     "danger": "#a84b3f",
     "log_bg": "#12202d",
-    "log_line": "#284055",
+    "log_line": "#294155",
 }
 
 FONTS = {
@@ -44,16 +46,11 @@ FONTS = {
     "title": ("Segoe UI Semibold", 11),
     "body": ("Segoe UI", 10),
     "body_small": ("Segoe UI", 9),
-    "metric": ("Georgia", 16, "bold"),
+    "metric": ("Georgia", 15, "bold"),
     "button": ("Segoe UI Semibold", 10),
+    "eyebrow": ("Segoe UI Semibold", 9),
     "log": ("Consolas", 10),
 }
-
-
-def normalize_ascii(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text)
-    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
-    return ascii_text.upper()
 
 
 def project_root() -> Path:
@@ -79,13 +76,6 @@ def first_file(directory: Path | None, pattern: str) -> str:
     return str(matches[0].resolve()) if matches else ""
 
 
-def find_validation_directory(root: Path) -> Path | None:
-    for child in sorted(root.iterdir()):
-        if child.is_dir() and normalize_ascii(child.name).startswith("VALIDA"):
-            return child
-    return None
-
-
 def timestamp_suffix() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -100,29 +90,48 @@ def open_path(target: Path) -> None:
     subprocess.run(["xdg-open", str(target)], check=False)
 
 
+def enable_high_dpi() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def resampling_lanczos() -> int:
+    if hasattr(Image, "Resampling"):
+        return Image.Resampling.LANCZOS
+    return Image.LANCZOS
+
+
 class ExtractorApp(tk.Tk):
     def __init__(self) -> None:
+        enable_high_dpi()
         super().__init__()
 
         self.root_dir = project_root()
-        self.validation_dir = find_validation_directory(self.root_dir)
         self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
 
-        manual_default = first_file(self.validation_dir, "*.xlsx")
         self.pdf_var = tk.StringVar(value=first_file(self.root_dir / "entrada", "*.pdf"))
-        self.manual_var = tk.StringVar(value=manual_default)
         self.output_var = tk.StringVar(value=str((self.root_dir / "saida").resolve()))
-        self.validate_var = tk.BooleanVar(value=bool(manual_default))
-        self.status_var = tk.StringVar(value="Pronto para consolidar um relatório.")
+        self.status_var = tk.StringVar(value="Pronto para gerar a planilha final.")
         self.metric_pdf_var = tk.StringVar(value="Aguardando PDF")
         self.metric_records_var = tk.StringVar(value="Sem leitura")
-        self.metric_validation_var = tk.StringVar(value="Validação opcional")
         self.metric_quality_var = tk.StringVar(value="Sem execução")
         self.last_output_dir = Path(self.output_var.get())
 
-        self._window_icon_photo: tk.PhotoImage | None = None
-        self._brand_photo: tk.PhotoImage | None = None
+        self._window_icon_photos: list[object] = []
+        self._brand_photo: object | None = None
 
         self._configure_window()
         self._configure_window_icon()
@@ -131,8 +140,8 @@ class ExtractorApp(tk.Tk):
 
     def _configure_window(self) -> None:
         self.title(APP_TITLE)
-        self.geometry("1180x740")
-        self.minsize(980, 680)
+        self.geometry("1160x720")
+        self.minsize(960, 660)
         self.configure(bg=COLORS["ink"])
         self.option_add("*tearOff", False)
 
@@ -160,9 +169,26 @@ class ExtractorApp(tk.Tk):
         icon_ico = resource_path("assets", "extrator_precatorios.ico")
 
         if icon_png.exists():
-            self._window_icon_photo = tk.PhotoImage(file=str(icon_png))
-            self.iconphoto(True, self._window_icon_photo)
-            self._brand_photo = self._window_icon_photo.subsample(8, 8)
+            try:
+                with Image.open(icon_png) as source:
+                    base_image = source.convert("RGBA")
+                    sampler = resampling_lanczos()
+
+                    brand_image = base_image.resize((BRAND_ICON_SIZE, BRAND_ICON_SIZE), sampler)
+                    self._brand_photo = ImageTk.PhotoImage(brand_image)
+
+                    for size in WINDOW_ICON_SIZES:
+                        resized = base_image.resize((size, size), sampler)
+                        photo = ImageTk.PhotoImage(resized)
+                        self._window_icon_photos.append(photo)
+
+                if self._window_icon_photos:
+                    self.iconphoto(True, *self._window_icon_photos)
+            except Exception:
+                fallback = tk.PhotoImage(file=str(icon_png))
+                self._window_icon_photos.append(fallback)
+                self.iconphoto(True, fallback)
+                self._brand_photo = fallback.subsample(8, 8)
 
         if icon_ico.exists():
             try:
@@ -174,11 +200,18 @@ class ExtractorApp(tk.Tk):
         shell = tk.Frame(self, bg=COLORS["ink"])
         shell.pack(fill="both", expand=True, padx=18, pady=18)
 
-        rail = tk.Frame(shell, bg=COLORS["ink_soft"], width=324, padx=28, pady=26)
+        rail = tk.Frame(shell, bg=COLORS["ink_soft"], width=304, padx=28, pady=28)
         rail.pack(side="left", fill="y")
         rail.pack_propagate(False)
 
-        stage = tk.Frame(shell, bg=COLORS["paper"], padx=28, pady=26, highlightthickness=1, highlightbackground=COLORS["paper_line"])
+        stage = tk.Frame(
+            shell,
+            bg=COLORS["paper"],
+            padx=32,
+            pady=30,
+            highlightthickness=1,
+            highlightbackground=COLORS["paper_line"],
+        )
         stage.pack(side="left", fill="both", expand=True)
 
         self._build_brand_rail(rail)
@@ -189,12 +222,12 @@ class ExtractorApp(tk.Tk):
         brand_top.pack(fill="x")
 
         if self._brand_photo is not None:
-            tk.Label(brand_top, image=self._brand_photo, bg=COLORS["ink_soft"]).pack(anchor="w", pady=(0, 14))
+            tk.Label(brand_top, image=self._brand_photo, bg=COLORS["ink_soft"]).pack(anchor="w", pady=(0, 16))
 
         tk.Label(
             brand_top,
             text="Extrator de\nPrecatórios",
-            font=("Georgia", 27, "bold"),
+            font=("Georgia", 26, "bold"),
             fg=COLORS["paper"],
             bg=COLORS["ink_soft"],
             justify="left",
@@ -202,43 +235,27 @@ class ExtractorApp(tk.Tk):
 
         tk.Label(
             brand_top,
-            text="Leitura institucional de PDF com consolidação auditável, regras de cessão e validação cruzada em Excel.",
+            text="Leitura institucional de PDF com consolidação estruturada e saída pronta para operação.",
             font=FONTS["body_small"],
             fg=COLORS["gold_soft"],
             bg=COLORS["ink_soft"],
             justify="left",
-            wraplength=250,
+            wraplength=228,
         ).pack(anchor="w", pady=(10, 18))
 
         tk.Frame(parent, bg=COLORS["gold"], height=2).pack(fill="x", pady=(0, 18))
 
         self._build_side_section(
             parent,
-            "Fluxo curado",
+            "Fluxo essencial",
             [
-                ("1", "PDF tratado sem repetir cabeçalhos e sem quebrar o registro."),
-                ("2", "Regras de pagamento aplicadas antes de escrever a planilha final."),
-                ("3", "Comparativo com base manual e relatório das diferenças confirmadas."),
+                ("1", "Leitura textual do PDF com limpeza estrutural e agrupamento por processo."),
+                ("2", "Aplicação das regras de pagamento antes de montar a planilha final."),
+                ("3", "Entrega de Excel consolidado e relatório técnico da execução."),
             ],
         )
 
         self._build_metric_panel(parent)
-
-        self.open_output_button = tk.Button(
-            parent,
-            text="Abrir pasta de saída",
-            command=self._open_output_dir,
-            font=FONTS["button"],
-            bg=COLORS["ink_panel"],
-            fg=COLORS["paper"],
-            activebackground=COLORS["gold"],
-            activeforeground=COLORS["ink"],
-            bd=0,
-            padx=16,
-            pady=12,
-            cursor="hand2",
-        )
-        self.open_output_button.pack(fill="x", side="bottom", pady=(18, 0))
 
     def _build_side_section(self, parent: tk.Frame, title: str, items: list[tuple[str, str]]) -> None:
         section = tk.Frame(parent, bg=COLORS["ink_soft"])
@@ -247,14 +264,21 @@ class ExtractorApp(tk.Tk):
         tk.Label(
             section,
             text=title.upper(),
-            font=("Segoe UI Semibold", 9),
+            font=FONTS["eyebrow"],
             fg=COLORS["gold"],
             bg=COLORS["ink_soft"],
             anchor="w",
         ).pack(anchor="w", pady=(0, 10))
 
         for number, text in items:
-            row = tk.Frame(section, bg=COLORS["ink_panel"], highlightthickness=1, highlightbackground="#30465c", padx=12, pady=11)
+            row = tk.Frame(
+                section,
+                bg=COLORS["ink_panel"],
+                highlightthickness=1,
+                highlightbackground="#31475c",
+                padx=12,
+                pady=11,
+            )
             row.pack(fill="x", pady=(0, 8))
 
             chip = tk.Label(
@@ -264,7 +288,6 @@ class ExtractorApp(tk.Tk):
                 font=("Georgia", 11, "bold"),
                 fg=COLORS["ink"],
                 bg=COLORS["gold"],
-                padx=0,
                 pady=6,
             )
             chip.pack(side="left", padx=(0, 10))
@@ -276,28 +299,34 @@ class ExtractorApp(tk.Tk):
                 fg=COLORS["paper"],
                 bg=COLORS["ink_panel"],
                 justify="left",
-                wraplength=190,
+                wraplength=184,
             ).pack(side="left", fill="x", expand=True)
 
     def _build_metric_panel(self, parent: tk.Frame) -> None:
         wrapper = tk.Frame(parent, bg=COLORS["ink_soft"])
-        wrapper.pack(fill="x", pady=(0, 8))
+        wrapper.pack(fill="x")
 
         tk.Label(
             wrapper,
-            text="Painel da execução".upper(),
-            font=("Segoe UI Semibold", 9),
+            text="Pulso da execução".upper(),
+            font=FONTS["eyebrow"],
             fg=COLORS["gold"],
             bg=COLORS["ink_soft"],
         ).pack(anchor="w", pady=(0, 10))
 
         self._build_metric_card(wrapper, "Arquivo em foco", self.metric_pdf_var).pack(fill="x", pady=(0, 8))
         self._build_metric_card(wrapper, "Registros extraídos", self.metric_records_var).pack(fill="x", pady=(0, 8))
-        self._build_metric_card(wrapper, "Validação", self.metric_validation_var).pack(fill="x", pady=(0, 8))
         self._build_metric_card(wrapper, "Qualidade", self.metric_quality_var).pack(fill="x")
 
     def _build_metric_card(self, parent: tk.Frame, label: str, variable: tk.StringVar) -> tk.Frame:
-        card = tk.Frame(parent, bg=COLORS["ink_panel"], highlightthickness=1, highlightbackground="#30465c", padx=12, pady=10)
+        card = tk.Frame(
+            parent,
+            bg=COLORS["ink_panel"],
+            highlightthickness=1,
+            highlightbackground="#31475c",
+            padx=12,
+            pady=10,
+        )
         tk.Label(
             card,
             text=label.upper(),
@@ -313,7 +342,7 @@ class ExtractorApp(tk.Tk):
             fg=COLORS["paper"],
             bg=COLORS["ink_panel"],
             justify="left",
-            wraplength=220,
+            wraplength=214,
         ).pack(anchor="w", pady=(6, 0))
         return card
 
@@ -323,7 +352,15 @@ class ExtractorApp(tk.Tk):
 
         tk.Label(
             hero,
-            text="Consolide o relatório em uma planilha limpa, com regra de pagamento aplicada e trilha de validação pronta.",
+            text="FLUXO PRINCIPAL",
+            font=FONTS["eyebrow"],
+            fg=COLORS["gold"],
+            bg=COLORS["paper"],
+        ).pack(anchor="w", pady=(0, 8))
+
+        tk.Label(
+            hero,
+            text="Transforme o relatório em uma planilha final limpa, com regra de pagamento aplicada e rastreabilidade técnica preservada.",
             font=FONTS["display"],
             fg=COLORS["text_dark"],
             bg=COLORS["paper"],
@@ -333,7 +370,7 @@ class ExtractorApp(tk.Tk):
 
         tk.Label(
             hero,
-            text="Esta interface usa o mesmo núcleo que já foi validado no PDF real: remove cabeçalhos repetidos, preserva o vínculo correto por processo e devolve planilha, relatório técnico e comparativo manual quando solicitado.",
+            text="O núcleo trata o PDF real, remove repetições estruturais e mantém o vínculo correto por processo sem depender de fluxos paralelos.",
             font=FONTS["body"],
             fg=COLORS["text_soft"],
             bg=COLORS["paper"],
@@ -343,7 +380,7 @@ class ExtractorApp(tk.Tk):
 
         tag_row = tk.Frame(hero, bg=COLORS["paper"])
         tag_row.pack(anchor="w", pady=(0, 18))
-        for label in ("PDF", "Regras de cessão", "Excel final", "Validação manual"):
+        for label in ("PDF real", "Regras de cessão", "Excel final", "Relatório técnico"):
             tk.Label(
                 tag_row,
                 text=label,
@@ -356,9 +393,9 @@ class ExtractorApp(tk.Tk):
 
         form_card = tk.Frame(
             parent,
-            bg="#fbf8f1",
-            padx=22,
-            pady=22,
+            bg=COLORS["paper_panel"],
+            padx=24,
+            pady=24,
             highlightthickness=1,
             highlightbackground=COLORS["paper_line"],
         )
@@ -369,12 +406,20 @@ class ExtractorApp(tk.Tk):
             text="Entradas do processamento",
             font=FONTS["display_small"],
             fg=COLORS["text_dark"],
-            bg="#fbf8f1",
+            bg=COLORS["paper_panel"],
         ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        tk.Label(
+            form_card,
+            text="Fluxo enxuto: informe o relatório e a pasta onde a entrega será gerada.",
+            font=FONTS["body_small"],
+            fg=COLORS["text_soft"],
+            bg=COLORS["paper_panel"],
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 2))
 
         self._build_path_row(
             form_card,
-            row=1,
+            row=2,
             title="PDF do relatório",
             subtitle="Arquivo base usado para extrair os registros de pagamento.",
             variable=self.pdf_var,
@@ -382,49 +427,25 @@ class ExtractorApp(tk.Tk):
         )
         self._build_path_row(
             form_card,
-            row=2,
-            title="Planilha manual",
-            subtitle="Opcional. Use quando quiser comparar a saída automática com a base antiga.",
-            variable=self.manual_var,
-            command=self._choose_manual,
-            is_manual=True,
-        )
-        self._build_path_row(
-            form_card,
-            row=3,
+            row=4,
             title="Pasta de saída",
-            subtitle="O app cria os arquivos com timestamp para evitar conflito com planilhas abertas.",
+            subtitle="Os arquivos são gerados com timestamp para evitar conflito com versões abertas.",
             variable=self.output_var,
             command=self._choose_output_dir,
             folder_mode=True,
         )
-
-        self.validate_check = tk.Checkbutton(
-            form_card,
-            text="Executar comparação com a planilha manual e gerar relatório comparativo",
-            variable=self.validate_var,
-            command=self._toggle_manual_state,
-            bg="#fbf8f1",
-            fg=COLORS["text_dark"],
-            activebackground="#fbf8f1",
-            activeforeground=COLORS["text_dark"],
-            selectcolor=COLORS["paper_soft"],
-            font=FONTS["body"],
-            anchor="w",
-        )
-        self.validate_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         action_row = tk.Frame(parent, bg=COLORS["paper"])
         action_row.pack(fill="x", pady=(0, 16))
 
         self.run_button = tk.Button(
             action_row,
-            text="Extrair planilha e relatório",
+            text="Gerar planilha final",
             command=self._start_run,
             font=FONTS["button"],
             bg=COLORS["gold"],
             fg=COLORS["ink"],
-            activebackground="#ddb55f",
+            activebackground="#dcb25d",
             activeforeground=COLORS["ink"],
             bd=0,
             padx=18,
@@ -482,7 +503,7 @@ class ExtractorApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             log_card,
-            text="Acompanhe o que foi lido, o que foi gerado e qualquer pendência tratada pelo fluxo.",
+            text="Acompanhe a leitura, os arquivos gerados e qualquer revisão interna sinalizada pelo núcleo.",
             font=FONTS["body_small"],
             fg="#9db0c2",
             bg=COLORS["log_bg"],
@@ -491,7 +512,7 @@ class ExtractorApp(tk.Tk):
         self.log_text = ScrolledText(
             log_card,
             wrap="word",
-            height=16,
+            height=15,
             font=FONTS["log"],
             bg=COLORS["log_bg"],
             fg="#d9e3ec",
@@ -503,8 +524,6 @@ class ExtractorApp(tk.Tk):
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
-        self._toggle_manual_state()
-
     def _build_path_row(
         self,
         parent: tk.Frame,
@@ -513,26 +532,23 @@ class ExtractorApp(tk.Tk):
         subtitle: str,
         variable: tk.StringVar,
         command: object,
-        is_manual: bool = False,
         folder_mode: bool = False,
     ) -> None:
-        base_row = (row - 1) * 2 + 1
-
         tk.Label(
             parent,
             text=title,
             font=FONTS["title"],
             fg=COLORS["text_dark"],
-            bg="#fbf8f1",
-        ).grid(row=base_row, column=0, sticky="w", pady=(16, 2))
+            bg=COLORS["paper_panel"],
+        ).grid(row=row, column=0, sticky="w", pady=(16, 2))
 
         tk.Label(
             parent,
             text=subtitle,
             font=FONTS["body_small"],
             fg=COLORS["text_soft"],
-            bg="#fbf8f1",
-        ).grid(row=base_row + 1, column=0, sticky="w", pady=(0, 8))
+            bg=COLORS["paper_panel"],
+        ).grid(row=row + 1, column=0, sticky="w", pady=(0, 8))
 
         entry = tk.Entry(
             parent,
@@ -547,12 +563,11 @@ class ExtractorApp(tk.Tk):
             highlightbackground=COLORS["paper_line"],
             highlightcolor=COLORS["gold"],
         )
-        entry.grid(row=base_row, column=1, rowspan=2, sticky="ew", padx=(16, 12), pady=(12, 8), ipady=10)
+        entry.grid(row=row, column=1, rowspan=2, sticky="ew", padx=(16, 12), pady=(12, 8), ipady=10)
 
-        button_label = "Escolher pasta" if folder_mode else "Escolher"
         button = tk.Button(
             parent,
-            text=button_label,
+            text="Escolher pasta" if folder_mode else "Escolher",
             command=command,
             font=FONTS["button"],
             bg=COLORS["ink_soft"],
@@ -564,28 +579,9 @@ class ExtractorApp(tk.Tk):
             pady=10,
             cursor="hand2",
         )
-        button.grid(row=base_row, column=2, rowspan=2, sticky="nsew", pady=(12, 8))
+        button.grid(row=row, column=2, rowspan=2, sticky="nsew", pady=(12, 8))
 
         parent.columnconfigure(1, weight=1)
-
-        if is_manual:
-            self.manual_entry = entry
-            self.manual_button = button
-
-    def _toggle_manual_state(self) -> None:
-        state = "normal" if self.validate_var.get() else "disabled"
-        entry_background = "#ffffff" if state == "normal" else "#ece6d9"
-
-        self.manual_entry.configure(state=state, disabledbackground=entry_background, disabledforeground=COLORS["text_soft"])
-        self.manual_button.configure(state=state)
-
-        if self.validate_var.get():
-            self.run_button.configure(text="Extrair, validar e gerar relatórios")
-            if not self.manual_var.get().strip():
-                self.metric_validation_var.set("Base manual pendente")
-        else:
-            self.run_button.configure(text="Extrair planilha e relatório")
-            self.metric_validation_var.set("Validação desativada")
 
     def _choose_pdf(self) -> None:
         selected = filedialog.askopenfilename(
@@ -596,18 +592,6 @@ class ExtractorApp(tk.Tk):
         if selected:
             self.pdf_var.set(selected)
             self.metric_pdf_var.set(Path(selected).name)
-
-    def _choose_manual(self) -> None:
-        initial_dir = self.validation_dir if self.validation_dir is not None else self.root_dir
-        selected = filedialog.askopenfilename(
-            title="Escolha a planilha manual",
-            filetypes=[("Planilhas Excel", "*.xlsx")],
-            initialdir=str(initial_dir.resolve()),
-        )
-        if selected:
-            self.manual_var.set(selected)
-            self.validate_var.set(True)
-            self._toggle_manual_state()
 
     def _choose_output_dir(self) -> None:
         selected = filedialog.askdirectory(
@@ -635,13 +619,9 @@ class ExtractorApp(tk.Tk):
 
         pdf_path = Path(self.pdf_var.get().strip())
         output_dir = Path(self.output_var.get().strip())
-        manual_path = Path(self.manual_var.get().strip()) if self.manual_var.get().strip() else None
 
         if not pdf_path.exists():
             messagebox.showerror(APP_TITLE, "Escolha um PDF válido antes de continuar.")
-            return
-        if self.validate_var.get() and (manual_path is None or not manual_path.exists()):
-            messagebox.showerror(APP_TITLE, "Escolha uma planilha manual válida ou desative a comparação.")
             return
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -653,80 +633,57 @@ class ExtractorApp(tk.Tk):
 
         self.metric_pdf_var.set(pdf_path.name)
         self.metric_records_var.set("Lendo o PDF...")
-        self.metric_validation_var.set("Aguardando comparação" if self.validate_var.get() else "Validação desativada")
         self.metric_quality_var.set("Em processamento")
 
         self.run_button.configure(state="disabled")
-        self.status_var.set("Processando o relatório e montando a saída...")
+        self.status_var.set("Processando o relatório e montando a saída final...")
         self.progress.start(10)
 
         self.worker_thread = threading.Thread(
             target=self._run_pipeline,
-            args=(pdf_path, output_dir, manual_path, self.validate_var.get()),
+            args=(pdf_path, output_dir),
             daemon=True,
         )
         self.worker_thread.start()
 
-    def _run_pipeline(
-        self,
-        pdf_path: Path,
-        output_dir: Path,
-        manual_path: Path | None,
-        should_validate: bool,
-    ) -> None:
+    def _run_pipeline(self, pdf_path: Path, output_dir: Path) -> None:
         stamp = timestamp_suffix()
         excel_path = output_dir / f"precatorios_extraidos_{stamp}.xlsx"
-        extract_report_path = output_dir / f"precatorios_validacao_{stamp}.txt"
-        compare_excel_path = output_dir / f"validacao_comparativa_{stamp}.xlsx"
-        compare_report_path = output_dir / f"validacao_comparativa_{stamp}.txt"
+        report_path = output_dir / f"precatorios_relatorio_tecnico_{stamp}.txt"
 
         try:
             self.log_queue.put(("log", f"PDF selecionado: {pdf_path}"))
-            self.log_queue.put(("log", "Executando extração do PDF..."))
-            extraction_result = run_extraction(pdf_path, excel_path, extract_report_path)
+            self.log_queue.put(("log", "Executando leitura estruturada do PDF..."))
+            extraction_result = run_extraction(pdf_path, excel_path, report_path)
 
             unresolved = sum(1 for item in extraction_result.built_rows if item.warnings)
-            self.log_queue.put(("metrics", {"records": str(len(extraction_result.built_rows)), "quality": f"{unresolved} pendências" if unresolved else "Leitura limpa"}))
-            self.log_queue.put(("log", f"Registros extraídos: {len(extraction_result.built_rows)}"))
-            self.log_queue.put(("log", f"Pendências internas: {unresolved}"))
-            self.log_queue.put(("log", f"Planilha criada: {excel_path.name}"))
-            self.log_queue.put(("log", f"Relatório técnico: {extract_report_path.name}"))
+            if unresolved:
+                quality_label = f"{unresolved} revisão" if unresolved == 1 else f"{unresolved} revisões"
+            else:
+                quality_label = "Leitura limpa"
 
-            validation_result = None
-            if should_validate and manual_path is not None:
-                self.log_queue.put(("log", "Executando comparação com a planilha manual..."))
-                validation_result = run_validation(
-                    manual_source=manual_path,
-                    auto_path=excel_path,
-                    pdf_path=pdf_path,
-                    output_path=compare_excel_path,
-                    report_path=compare_report_path,
+            self.log_queue.put(
+                (
+                    "metrics",
+                    {
+                        "records": str(len(extraction_result.built_rows)),
+                        "quality": quality_label,
+                    },
                 )
-                summary = validation_result.summary
-                self.log_queue.put(
-                    (
-                        "metrics",
-                        {
-                            "validation": f"{summary['matches_exatos']} matches exatos",
-                            "quality": f"{summary['matches_financeiros_nome_diferente']} nome | {summary['matches_processo_nome_valor_diferente']} valor",
-                        },
-                    )
-                )
-                self.log_queue.put(("log", f"Aba manual usada: {validation_result.sheet_name}"))
-                self.log_queue.put(("log", f"Matches exatos: {summary['matches_exatos']}"))
-                self.log_queue.put(("log", f"Nome divergente: {summary['matches_financeiros_nome_diferente']}"))
-                self.log_queue.put(("log", f"Valor/metadado divergente: {summary['matches_processo_nome_valor_diferente']}"))
-                self.log_queue.put(("log", f"Só na automação: {summary['somente_automatica']}"))
-                self.log_queue.put(("log", f"Comparativo Excel: {compare_excel_path.name}"))
-                self.log_queue.put(("log", f"Comparativo texto: {compare_report_path.name}"))
+            )
+            self.log_queue.put(("log", f"Registros extraídos: {len(extraction_result.built_rows)}"))
+            self.log_queue.put(("log", f"Revisões internas sinalizadas: {unresolved}"))
+            self.log_queue.put(("log", f"Planilha criada: {excel_path.name}"))
+            self.log_queue.put(("log", f"Relatório técnico: {report_path.name}"))
 
             self.log_queue.put(
                 (
                     "done",
                     {
                         "excel_path": excel_path,
-                        "extract_report_path": extract_report_path,
-                        "validation_result": validation_result,
+                        "report_path": report_path,
+                        "record_count": len(extraction_result.built_rows),
+                        "unresolved": unresolved,
                     },
                 )
             )
@@ -738,8 +695,6 @@ class ExtractorApp(tk.Tk):
             self.metric_pdf_var.set(payload["pdf"])
         if "records" in payload:
             self.metric_records_var.set(payload["records"])
-        if "validation" in payload:
-            self.metric_validation_var.set(payload["validation"])
         if "quality" in payload:
             self.metric_quality_var.set(payload["quality"])
 
@@ -763,28 +718,18 @@ class ExtractorApp(tk.Tk):
     def _handle_success(self, payload: dict[str, object]) -> None:
         self.progress.stop()
         self.run_button.configure(state="normal")
-        self.status_var.set("Processamento concluído com sucesso.")
+        self.status_var.set("Entrega concluída com sucesso.")
 
         lines = [
             f"Planilha extraída: {payload['excel_path']}",
-            f"Relatório técnico: {payload['extract_report_path']}",
+            f"Relatório técnico: {payload['report_path']}",
         ]
 
-        validation_result = payload.get("validation_result")
-        if validation_result is not None:
-            summary = validation_result.summary
-            lines.extend(
-                [
-                    f"Comparativo Excel: {validation_result.output_path}",
-                    f"Comparativo texto: {validation_result.report_path}",
-                    f"Matches exatos: {summary['matches_exatos']}",
-                    f"Nome divergente: {summary['matches_financeiros_nome_diferente']}",
-                    f"Valor/metadado divergente: {summary['matches_processo_nome_valor_diferente']}",
-                    f"Só na automação: {summary['somente_automatica']}",
-                ]
-            )
+        unresolved = int(payload["unresolved"])
+        if unresolved:
+            lines.append(f"Revisões internas sinalizadas: {unresolved}")
         else:
-            self.metric_validation_var.set("Validação não executada")
+            lines.append("Qualidade da leitura: sem revisões pendentes.")
 
         messagebox.showinfo(APP_TITLE, "\n".join(lines))
 
