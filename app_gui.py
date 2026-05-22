@@ -14,7 +14,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from PIL import Image, ImageTk
 
-from leitor_pdf import run_extraction
+from leitor_pdf import count_auto_adjustment_rows, count_manual_review_rows, run_extraction
 
 
 APP_TITLE = "Extrator de Precatórios"
@@ -656,9 +656,16 @@ class ExtractorApp(tk.Tk):
             self.log_queue.put(("log", "Executando leitura estruturada do PDF..."))
             extraction_result = run_extraction(pdf_path, excel_path, report_path)
 
-            unresolved = sum(1 for item in extraction_result.built_rows if item.warnings)
-            if unresolved:
-                quality_label = f"{unresolved} revisão" if unresolved == 1 else f"{unresolved} revisões"
+            review_cases = count_manual_review_rows(extraction_result.built_rows)
+            auto_adjustments = count_auto_adjustment_rows(extraction_result.built_rows)
+            if review_cases:
+                quality_label = f"{review_cases} revisão" if review_cases == 1 else f"{review_cases} revisões"
+            elif auto_adjustments:
+                quality_label = (
+                    f"{auto_adjustments} ajuste auto"
+                    if auto_adjustments == 1
+                    else f"{auto_adjustments} ajustes auto"
+                )
             else:
                 quality_label = "Leitura limpa"
 
@@ -672,7 +679,8 @@ class ExtractorApp(tk.Tk):
                 )
             )
             self.log_queue.put(("log", f"Registros extraídos: {len(extraction_result.built_rows)}"))
-            self.log_queue.put(("log", f"Revisões internas sinalizadas: {unresolved}"))
+            self.log_queue.put(("log", f"Revisões manuais sinalizadas: {review_cases}"))
+            self.log_queue.put(("log", f"Ajustes automáticos monitorados: {auto_adjustments}"))
             self.log_queue.put(("log", f"Planilha criada: {excel_path.name}"))
             self.log_queue.put(("log", f"Relatório técnico: {report_path.name}"))
 
@@ -683,7 +691,8 @@ class ExtractorApp(tk.Tk):
                         "excel_path": excel_path,
                         "report_path": report_path,
                         "record_count": len(extraction_result.built_rows),
-                        "unresolved": unresolved,
+                        "review_cases": review_cases,
+                        "auto_adjustments": auto_adjustments,
                     },
                 )
             )
@@ -725,10 +734,13 @@ class ExtractorApp(tk.Tk):
             f"Relatório técnico: {payload['report_path']}",
         ]
 
-        unresolved = int(payload["unresolved"])
-        if unresolved:
-            lines.append(f"Revisões internas sinalizadas: {unresolved}")
-        else:
+        review_cases = int(payload["review_cases"])
+        auto_adjustments = int(payload["auto_adjustments"])
+        if review_cases:
+            lines.append(f"Revisões manuais sinalizadas: {review_cases}")
+        if auto_adjustments:
+            lines.append(f"Ajustes automáticos monitorados: {auto_adjustments}")
+        if not review_cases and not auto_adjustments:
             lines.append("Qualidade da leitura: sem revisões pendentes.")
 
         messagebox.showinfo(APP_TITLE, "\n".join(lines))

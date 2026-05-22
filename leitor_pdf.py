@@ -36,6 +36,7 @@ PAYMENT_RE = re.compile(
     r"|PAGAMENTO\s+INTEGRAL"
     r"|CESSAO\s*-\s*ACORDO(?:\s+DIRETO)?"
 )
+ORPHAN_PAYMENT_RE = re.compile(r"\bPAGAMENTO\b(?!\s+(?:INTEGRAL|ANTECIPACAO))")
 
 # Coordenadas apos remover a rotacao do PDF.
 COLUMN_RANGES = {
@@ -71,6 +72,11 @@ HEADER_PATTERNS = [
     "VALOR DO BLOQUEIO",
 ]
 
+SUMMARY_LINE_PREFIXES = (
+    "TOTAL DE REGISTROS",
+    "VALOR TOTAL",
+)
+
 HEADER_TOKEN_GUARD = {
     "VALOR",
     "BLOQUEIO",
@@ -85,6 +91,15 @@ HEADER_TOKEN_GUARD = {
 LINE_Y_TOLERANCE = 1.2
 TOP_BAND_PADDING = 12.0
 NAME_SEGMENTS_KEY = "__name_segments__"
+MANUAL_REVIEW_FLAGS = {
+    "multiple_liquid_tokens",
+    "multiple_process_ids",
+    "liquid_gt_gross",
+}
+AUTO_ADJUSTMENT_FLAGS = {
+    "inferred_payment_type",
+    "sequence_adjusted",
+}
 
 
 @dataclass
@@ -103,12 +118,24 @@ class PaymentComponent:
 
 
 @dataclass
+class PaymentBuildDiagnostics:
+    raw_payment_type_count: int
+    raw_date_count: int
+    raw_gross_count: int
+    inferred_payment_type_count: int
+    sequence_adjusted: bool
+
+
+@dataclass
 class BuiltRow:
     row: dict[str, object]
     component_count: int
     retained_component_count: int
     had_cession: bool
     warnings: list[str]
+    diagnostic_flags: list[str]
+    validation_notes: list[str]
+    source_page: int
 
 
 @dataclass
@@ -186,6 +213,26 @@ def canonical_payment_name(normalized_match: str) -> str:
 def extract_payment_types(chunks: Iterable[str]) -> list[str]:
     text = normalize_ascii("\n".join(chunks))
     return [canonical_payment_name(match.group(0)) for match in PAYMENT_RE.finditer(text)]
+
+
+def infer_missing_payment_types(
+    raw_chunks: Iterable[str],
+    payment_types: list[str],
+    dates: list[str],
+    gross_tokens: list[str],
+) -> list[str]:
+    expected_components = min(len(dates), len(gross_tokens))
+    missing_count = expected_components - len(payment_types)
+    if missing_count <= 0:
+        return payment_types
+
+    raw_text = normalize_ascii("\n".join(raw_chunks))
+    inferred_count = min(missing_count, len(ORPHAN_PAYMENT_RE.findall(raw_text)))
+    if inferred_count <= 0:
+        return payment_types
+
+    inferred_type = canonical_payment_name("PAGAMENTO ANTECIPACAO")
+    return payment_types + [inferred_type] * inferred_count
 
 
 def trim_redundant_items(items: list[str], target_length: int) -> list[str]:
@@ -297,6 +344,8 @@ def is_structural_line(line: ExtractedLine, top_limit: float) -> bool:
         return True
     if line.y > top_limit:
         return True
+    if line.normalized_text.startswith(SUMMARY_LINE_PREFIXES):
+        return True
     if any(pattern in line.normalized_text for pattern in HEADER_PATTERNS):
         return True
     words = set(line.normalized_text.split())
@@ -355,20 +404,42 @@ def collect_record_bands(page: fitz.Page) -> list[dict[str, list[str]]]:
     return records
 
 
-def build_payment_components(record: dict[str, list[str]]) -> tuple[list[PaymentComponent], list[str]]:
-    payment_types = extract_payment_types(record["tipo_pagamento"])
+def build_payment_components(
+    record: dict[str, list[str]],
+) -> tuple[list[PaymentComponent], list[str], PaymentBuildDiagnostics]:
+    raw_payment_types = extract_payment_types(record["tipo_pagamento"])
     dates = DATE_RE.findall(" ".join(record["data_pagamento"]))
     gross_tokens = VALUE_RE.findall(" ".join(record["valor_bruto"]))
-    payment_types, dates, gross_tokens = align_payment_sequences(payment_types, dates, gross_tokens)
+    payment_types = infer_missing_payment_types(record["tipo_pagamento"], raw_payment_types, dates, gross_tokens)
+    inferred_payment_type_count = max(0, len(payment_types) - len(raw_payment_types))
+
+    aligned_payment_types, aligned_dates, aligned_gross_tokens = align_payment_sequences(
+        payment_types,
+        dates,
+        gross_tokens,
+    )
+    sequence_adjusted = (
+        aligned_payment_types != payment_types
+        or aligned_dates != dates
+        or aligned_gross_tokens != gross_tokens
+    )
+
+    diagnostics = PaymentBuildDiagnostics(
+        raw_payment_type_count=len(raw_payment_types),
+        raw_date_count=len(dates),
+        raw_gross_count=len(gross_tokens),
+        inferred_payment_type_count=inferred_payment_type_count,
+        sequence_adjusted=sequence_adjusted,
+    )
 
     warnings: list[str] = []
-    if not payment_types or not dates or not gross_tokens:
+    if not aligned_payment_types or not aligned_dates or not aligned_gross_tokens:
         warnings.append("Nao foi possivel alinhar componentes de pagamento.")
-        return [], warnings
+        return [], warnings, diagnostics
 
-    if not (len(payment_types) == len(dates) == len(gross_tokens)):
+    if not (len(aligned_payment_types) == len(aligned_dates) == len(aligned_gross_tokens)):
         warnings.append("Quantidade divergente entre tipos, datas e valores brutos.")
-        return [], warnings
+        return [], warnings, diagnostics
 
     components = [
         PaymentComponent(
@@ -376,9 +447,9 @@ def build_payment_components(record: dict[str, list[str]]) -> tuple[list[Payment
             date=date,
             gross_value=parse_brazilian_number(gross_token),
         )
-        for payment_type, date, gross_token in zip(payment_types, dates, gross_tokens)
+        for payment_type, date, gross_token in zip(aligned_payment_types, aligned_dates, aligned_gross_tokens)
     ]
-    return components, warnings
+    return components, warnings, diagnostics
 
 
 def reduce_payment_components(
@@ -420,17 +491,47 @@ def join_entity_fragments(record: dict[str, list[str]]) -> str:
 
 
 def extract_liquid_value(record: dict[str, list[str]]) -> float | None:
-    tokens = VALUE_RE.findall(" ".join(record["valor_liquido"]))
+    tokens = dedupe_consecutive(VALUE_RE.findall(" ".join(record["valor_liquido"])))
     if not tokens:
         return None
     return parse_brazilian_number(tokens[0])
 
 
-def build_output_row(record: dict[str, list[str]]) -> BuiltRow:
+def extract_process_ids_in_band(record: dict[str, list[str]]) -> list[str]:
+    process_ids: list[str] = []
+    for chunk in record["processo"]:
+        process_id, _ = extract_process_id(chunk)
+        if process_id and process_id not in process_ids:
+            process_ids.append(process_id)
+    return process_ids
+
+
+def requires_manual_review(built_row: BuiltRow) -> bool:
+    return bool(
+        built_row.warnings
+        or (MANUAL_REVIEW_FLAGS & set(built_row.diagnostic_flags))
+    )
+
+
+def has_auto_adjustment(built_row: BuiltRow) -> bool:
+    return bool(AUTO_ADJUSTMENT_FLAGS & set(built_row.diagnostic_flags))
+
+
+def count_manual_review_rows(built_rows: Iterable[BuiltRow]) -> int:
+    return sum(1 for built_row in built_rows if requires_manual_review(built_row))
+
+
+def count_auto_adjustment_rows(built_rows: Iterable[BuiltRow]) -> int:
+    return sum(1 for built_row in built_rows if has_auto_adjustment(built_row))
+
+
+def build_output_row(record: dict[str, list[str]], source_page: int = 0) -> BuiltRow:
     process_id, process_remainder = extract_process_id(" ".join(record["processo"]))
-    components, warnings = build_payment_components(record)
+    components, warnings, diagnostics = build_payment_components(record)
     payment_type, payment_date, gross_total, retained_count, had_cession = reduce_payment_components(components)
     liquid_value = extract_liquid_value(record)
+    process_ids_in_band = extract_process_ids_in_band(record)
+    liquid_tokens = dedupe_consecutive(VALUE_RE.findall(" ".join(record["valor_liquido"])))
 
     row = {
         "Elaborador": "",
@@ -452,21 +553,49 @@ def build_output_row(record: dict[str, list[str]]) -> BuiltRow:
     if gross_total is None:
         warnings.append("Valor bruto nao identificado.")
 
+    diagnostic_flags: list[str] = []
+    validation_notes: list[str] = []
+
+    if diagnostics.inferred_payment_type_count:
+        diagnostic_flags.append("inferred_payment_type")
+        validation_notes.append(
+            f"Tipo de pagamento inferido automaticamente em {diagnostics.inferred_payment_type_count} componente(s)."
+        )
+    if diagnostics.sequence_adjusted:
+        diagnostic_flags.append("sequence_adjusted")
+        validation_notes.append("Sequencia de tipos, datas ou valores ajustada automaticamente.")
+    if len(liquid_tokens) > 1:
+        diagnostic_flags.append("multiple_liquid_tokens")
+        validation_notes.append(
+            f"Faixa contem {len(liquid_tokens)} valores liquidos; o primeiro valor foi usado na planilha."
+        )
+    if len(process_ids_in_band) > 1:
+        diagnostic_flags.append("multiple_process_ids")
+        validation_notes.append(
+            f"Faixa contem mais de um processo identificado: {', '.join(process_ids_in_band)}."
+        )
+    if gross_total is not None and liquid_value is not None and liquid_value > gross_total:
+        diagnostic_flags.append("liquid_gt_gross")
+        validation_notes.append("Valor liquido maior que o valor bruto consolidado.")
+
     return BuiltRow(
         row=row,
         component_count=len(components),
         retained_component_count=retained_count,
         had_cession=had_cession,
         warnings=warnings,
+        diagnostic_flags=diagnostic_flags,
+        validation_notes=validation_notes,
+        source_page=source_page,
     )
 
 
 def process_pdf(pdf_path: Path) -> list[BuiltRow]:
     built_rows: list[BuiltRow] = []
     with fitz.open(pdf_path) as document:
-        for page in document:
+        for page_number, page in enumerate(document, start=1):
             for record in collect_record_bands(page):
-                built_rows.append(build_output_row(record))
+                built_rows.append(build_output_row(record, source_page=page_number))
     return built_rows
 
 
@@ -512,30 +641,194 @@ def export_excel(rows: list[dict[str, object]], output_path: Path) -> None:
     workbook.save(output_path)
 
 
+def format_brl(value: float | int | None) -> str:
+    if value is None:
+        return "n/d"
+    formatted = f"{float(value):,.2f}"
+    return "R$ " + formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def format_delta(value: float | int) -> str:
+    sign = "+" if value > 0 else ""
+    formatted = f"{float(value):,.2f}"
+    return sign + formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def extract_pdf_declared_summary(pdf_path: Path) -> dict[str, float | int | None]:
+    with fitz.open(pdf_path) as document:
+        start_page = max(0, document.page_count - 3)
+        text = "\n".join(document[index].get_text("text") for index in range(start_page, document.page_count))
+
+    lines = [compact_whitespace(line) for line in text.splitlines() if compact_whitespace(line)]
+    normalized_lines = [normalize_ascii(line) for line in lines]
+
+    def find_money(label: str) -> float | None:
+        for index, normalized_line in enumerate(normalized_lines):
+            if label not in normalized_line:
+                continue
+            for offset in (1, -1, 2, -2, 3, -3):
+                probe = index + offset
+                if 0 <= probe < len(lines):
+                    match = VALUE_RE.search(lines[probe])
+                    if match:
+                        return parse_brazilian_number(match.group(0))
+        return None
+
+    def find_integer(label: str) -> int | None:
+        for index, normalized_line in enumerate(normalized_lines):
+            if label not in normalized_line:
+                continue
+            for offset in (-1, 1, -2, 2, -3, 3):
+                probe = index + offset
+                if 0 <= probe < len(lines) and re.fullmatch(r"\d+", lines[probe]):
+                    return int(lines[probe])
+        return None
+
+    return {
+        "declared_record_count": find_integer("TOTAL DE REGISTROS"),
+        "declared_party_gross_total": find_money("VALOR TOTAL DA PARTE APOS DESAGIO"),
+        "declared_party_liquid_total": find_money("VALOR LIQUIDO PAGO A PARTE"),
+    }
+
+
+def aggregate_pdf_declared_summaries(pdf_files: list[Path]) -> tuple[dict[str, float | int | None], int]:
+    summary = {
+        "declared_record_count": 0,
+        "declared_party_gross_total": 0.0,
+        "declared_party_liquid_total": 0.0,
+    }
+    parsed_count = 0
+
+    for pdf_file in pdf_files:
+        current = extract_pdf_declared_summary(pdf_file)
+        if any(current.values()):
+            parsed_count += 1
+        if current["declared_record_count"] is not None:
+            summary["declared_record_count"] += int(current["declared_record_count"])
+        if current["declared_party_gross_total"] is not None:
+            summary["declared_party_gross_total"] += float(current["declared_party_gross_total"])
+        if current["declared_party_liquid_total"] is not None:
+            summary["declared_party_liquid_total"] += float(current["declared_party_liquid_total"])
+
+    if parsed_count == 0:
+        return {
+            "declared_record_count": None,
+            "declared_party_gross_total": None,
+            "declared_party_liquid_total": None,
+        }, 0
+
+    return summary, parsed_count
+
+
 def write_validation_report(report_path: Path, built_rows: list[BuiltRow], pdf_files: list[Path]) -> None:
     total_rows = len(built_rows)
     rows_with_cession = sum(1 for built_row in built_rows if built_row.had_cession)
     rows_with_multiple_kept_payments = sum(
         1 for built_row in built_rows if built_row.retained_component_count > 1
     )
-    unresolved_warnings = [
-        f"{built_row.row['Nº do processo']} | {built_row.row['Nome do Credor']} | {'; '.join(built_row.warnings)}"
+    rows_with_inferred_payment_type = sum(
+        1 for built_row in built_rows if "inferred_payment_type" in built_row.diagnostic_flags
+    )
+    rows_with_sequence_adjustment = sum(
+        1 for built_row in built_rows if "sequence_adjusted" in built_row.diagnostic_flags
+    )
+    rows_with_multiple_liquid_tokens = sum(
+        1 for built_row in built_rows if "multiple_liquid_tokens" in built_row.diagnostic_flags
+    )
+    rows_with_multiple_process_ids = sum(
+        1 for built_row in built_rows if "multiple_process_ids" in built_row.diagnostic_flags
+    )
+    rows_with_liquid_gt_gross = sum(
+        1 for built_row in built_rows if "liquid_gt_gross" in built_row.diagnostic_flags
+    )
+
+    extracted_gross_total = round(
+        sum((built_row.row["Valor Bruto do Pagamento"] or 0) for built_row in built_rows),
+        2,
+    )
+    extracted_liquid_total = round(
+        sum((built_row.row["Valor líquido pago a parte"] or 0) for built_row in built_rows),
+        2,
+    )
+
+    declared_summary, parsed_summary_count = aggregate_pdf_declared_summaries(pdf_files)
+    declared_record_count = declared_summary["declared_record_count"]
+    declared_gross_total = declared_summary["declared_party_gross_total"]
+    declared_liquid_total = declared_summary["declared_party_liquid_total"]
+
+    manual_review_rows = [built_row for built_row in built_rows if requires_manual_review(built_row)]
+    auto_adjustment_rows = [
+        built_row
         for built_row in built_rows
-        if built_row.warnings
+        if has_auto_adjustment(built_row) and not requires_manual_review(built_row)
     ]
 
     lines = [
         f"PDFs processados: {len(pdf_files)}",
         f"Arquivos: {', '.join(pdf.name for pdf in pdf_files)}",
         f"Registros extraidos: {total_rows}",
+        f"Valor bruto consolidado extraido: {format_brl(extracted_gross_total)}",
+        f"Valor liquido consolidado extraido: {format_brl(extracted_liquid_total)}",
         f"Registros com cessao filtrada: {rows_with_cession}",
         f"Registros com soma de multiplos pagamentos mantidos: {rows_with_multiple_kept_payments}",
-        f"Pendencias de validacao: {len(unresolved_warnings)}",
+        f"Registros com tipo inferido automaticamente: {rows_with_inferred_payment_type}",
+        f"Registros com ajuste automatico de sequencia: {rows_with_sequence_adjustment}",
+        f"Registros com mais de um valor liquido na faixa: {rows_with_multiple_liquid_tokens}",
+        f"Faixas com mais de um processo identificado: {rows_with_multiple_process_ids}",
+        f"Registros com liquido maior que bruto: {rows_with_liquid_gt_gross}",
+        f"Registros com ajuste automatico monitorado: {count_auto_adjustment_rows(built_rows)}",
+        f"Pendencias de validacao: {sum(1 for built_row in built_rows if built_row.warnings)}",
+        f"Casos para revisao manual: {len(manual_review_rows)}",
     ]
-    if unresolved_warnings:
-        lines.append("")
-        lines.append("Pendencias:")
-        lines.extend(unresolved_warnings)
+
+    if parsed_summary_count:
+        gross_delta = round(
+            extracted_gross_total - float(declared_gross_total or 0),
+            2,
+        )
+        liquid_delta = round(
+            extracted_liquid_total - float(declared_liquid_total or 0),
+            2,
+        )
+        record_delta = total_rows - int(declared_record_count or 0)
+
+        lines.extend(
+            [
+                "",
+                f"Resumo oficial identificado em: {parsed_summary_count}/{len(pdf_files)} PDF(s)",
+                f"Total de registros do PDF: {declared_record_count}",
+                f"Diferenca de registros extraidos x PDF: {record_delta}",
+                f"Valor total da parte apos desagio no PDF: {format_brl(float(declared_gross_total or 0))}",
+                f"Diferenca do bruto extraido x PDF: {format_delta(gross_delta)}",
+                f"Valor liquido pago a parte no PDF: {format_brl(float(declared_liquid_total or 0))}",
+                f"Diferenca do liquido extraido x PDF: {format_delta(liquid_delta)}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Resumo oficial do PDF: nao localizado nas ultimas paginas processadas.",
+            ]
+        )
+
+    if manual_review_rows:
+        lines.extend(["", "Casos para revisao manual:"])
+        for built_row in manual_review_rows:
+            notes = built_row.validation_notes + built_row.warnings
+            lines.append(
+                f"p.{built_row.source_page} | {built_row.row['Nº do processo']} | "
+                f"{built_row.row['Nome do Credor']} | {'; '.join(notes)}"
+            )
+
+    if auto_adjustment_rows:
+        lines.extend(["", "Ajustes automaticos monitorados:"])
+        for built_row in auto_adjustment_rows:
+            notes = built_row.validation_notes + built_row.warnings
+            lines.append(
+                f"p.{built_row.source_page} | {built_row.row['Nº do processo']} | "
+                f"{built_row.row['Nome do Credor']} | {'; '.join(notes)}"
+            )
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -603,9 +896,13 @@ def main() -> int:
         return 1
 
     unresolved_warnings = sum(1 for built_row in result.built_rows if built_row.warnings)
+    manual_review_count = count_manual_review_rows(result.built_rows)
+    auto_adjustment_count = count_auto_adjustment_rows(result.built_rows)
     print(f"PDFs processados: {len(result.pdf_files)}")
     print(f"Registros extraidos: {len(result.built_rows)}")
     print(f"Pendencias de validacao: {unresolved_warnings}")
+    print(f"Casos para revisao manual: {manual_review_count}")
+    print(f"Ajustes automaticos monitorados: {auto_adjustment_count}")
     print(f"Planilha gerada em: {result.output_path}")
     print(f"Relatorio gerado em: {result.report_path}")
     return 0

@@ -1,13 +1,20 @@
 import unittest
 
 from leitor_pdf import (
+    COLUMN_RANGES,
+    OUTPUT_COLUMNS,
+    ExtractedLine,
     PaymentComponent,
     align_payment_sequences,
     build_output_row,
     build_precatorio_number,
+    count_auto_adjustment_rows,
+    count_manual_review_rows,
     extract_payment_types,
     extract_process_id,
+    is_structural_line,
     join_name_fragments,
+    normalize_ascii,
     reduce_payment_components,
 )
 
@@ -165,6 +172,101 @@ class LeitorPdfRulesTest(unittest.TestCase):
 
         self.assertEqual(built_row.row["Nº do processo"], "201900120859")
         self.assertEqual(built_row.row["Nº precatorio"], "12085919")
+
+
+    def test_build_output_row_infers_anticipation_from_orphan_payment_token(self) -> None:
+        record = {
+            "processo": ["201300105009"],
+            "credor": [
+                "MARIA APARECIDA DOS SANTOS - MEEIRA",
+                "DE JOSE RINALDO BEZERRA ARAUJO -",
+                "FALECIDO) E HERDEIRA DE JOSEFA",
+                "BEZERRA ARAUJO",
+            ],
+            "entidade": ["ESTADO DE SERGIPE"],
+            "data_pagamento": ["24/11/2025", "24/11/2025", "27/11/2025"],
+            "tipo_pagamento": ["Pagamento Integral", "CessÃ£o - Acordo Direto", "Pagamento"],
+            "tipo_antecipacao": ["-"],
+            "valor_bruto": ["3.333,36", "2.222,23", "40.787,05"],
+            "previdencia": [],
+            "imposto_renda": ["0,00", "0,00"],
+            "bloqueio": ["666,67", "666,67", "7.831,11", "7.831,11"],
+            "valor_liquido": ["25.493,37"],
+            "__name_segments__": [
+                "MARIA APARECIDA DOS SANTOS - MEEIRA",
+                "DE JOSE RINALDO BEZERRA ARAUJO -",
+                "FALECIDO) E HERDEIRA DE JOSEFA",
+                "BEZERRA ARAUJO",
+            ],
+        }
+
+        built_row = build_output_row(record)
+
+        self.assertEqual(
+            built_row.row["Tipo de pagamento"],
+            "Pagamento Integral + Pagamento Antecipação",
+        )
+        self.assertEqual(built_row.row["Data pagamento"], "24/11/2025 | 27/11/2025")
+        self.assertEqual(built_row.row["Valor Bruto do Pagamento"], 44120.41)
+
+    def test_is_structural_line_flags_pdf_summary_footer(self) -> None:
+        text = "Total de registros: 3715 Valor total: R$ 381.538.524,19"
+        line = ExtractedLine(
+            y=532.97,
+            columns={key: "" for key in COLUMN_RANGES},
+            text=text,
+            normalized_text=normalize_ascii(text),
+        )
+
+        self.assertTrue(is_structural_line(line, top_limit=700.0))
+
+    def test_review_counters_distinguish_manual_review_from_auto_adjustment(self) -> None:
+        auto_adjustment_record = {
+            "processo": ["201300105009"],
+            "credor": [
+                "MARIA APARECIDA DOS SANTOS - MEEIRA",
+                "DE JOSE RINALDO BEZERRA ARAUJO -",
+                "FALECIDO) E HERDEIRA DE JOSEFA",
+                "BEZERRA ARAUJO",
+            ],
+            "entidade": ["ESTADO DE SERGIPE"],
+            "data_pagamento": ["24/11/2025", "24/11/2025", "27/11/2025"],
+            "tipo_pagamento": ["Pagamento Integral", "Cessão - Acordo Direto", "Pagamento"],
+            "tipo_antecipacao": ["-"],
+            "valor_bruto": ["3.333,36", "2.222,23", "40.787,05"],
+            "previdencia": [],
+            "imposto_renda": ["0,00", "0,00"],
+            "bloqueio": ["666,67", "666,67", "7.831,11", "7.831,11"],
+            "valor_liquido": ["25.493,37"],
+            "__name_segments__": [
+                "MARIA APARECIDA DOS SANTOS - MEEIRA",
+                "DE JOSE RINALDO BEZERRA ARAUJO -",
+                "FALECIDO) E HERDEIRA DE JOSEFA",
+                "BEZERRA ARAUJO",
+            ],
+        }
+        manual_review_record = {
+            "processo": ["202500147025"],
+            "credor": ["JAIRTON SANTOS DE ANDRADE"],
+            "entidade": ["ESTADO DE SERGIPE"],
+            "data_pagamento": ["23/09/2025"],
+            "tipo_pagamento": ["Pagamento Antecipação"],
+            "tipo_antecipacao": ["Idoso"],
+            "valor_bruto": ["40.787,05"],
+            "previdencia": [],
+            "imposto_renda": ["0,00"],
+            "bloqueio": [],
+            "valor_liquido": ["40.787,05", "381.538.524,19"],
+            "__name_segments__": ["JAIRTON SANTOS DE ANDRADE"],
+        }
+
+        auto_adjustment_row = build_output_row(auto_adjustment_record)
+        manual_review_row = build_output_row(manual_review_record)
+
+        self.assertEqual(auto_adjustment_row.row[OUTPUT_COLUMNS[1]], "201300105009")
+        self.assertEqual(manual_review_row.row[OUTPUT_COLUMNS[1]], "202500147025")
+        self.assertEqual(count_manual_review_rows([auto_adjustment_row, manual_review_row]), 1)
+        self.assertEqual(count_auto_adjustment_rows([auto_adjustment_row, manual_review_row]), 1)
 
 
 if __name__ == "__main__":

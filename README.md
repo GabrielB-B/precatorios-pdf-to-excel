@@ -22,6 +22,8 @@ The result is a tool that is better suited for operational use on real instituti
 - Automatic precatório number normalization derived from the process number
 - Payment consolidation rules applied before Excel export
 - Technical report generated alongside the final spreadsheet
+- Reconciliation of extracted totals against the official summary printed in the PDF
+- Review-oriented validation signals for truncated payment types, multi-liquid bands, and band-integrity anomalies
 - Branded desktop application with Windows executable packaging
 
 ## Processing Flow
@@ -126,6 +128,7 @@ Current coverage includes:
 - payment-type extraction from fragmented text
 - cession filtering rules
 - anticipation plus full-payment aggregation
+- automatic recovery of truncated payment markers such as orphan `Pagamento`
 - precatório number derivation from the process number
 - name reconstruction across broken column segments
 

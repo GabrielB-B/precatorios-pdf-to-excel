@@ -203,6 +203,13 @@ def detect_sheet_mapping(sheet_name: str, dataframe: pd.DataFrame) -> SheetMappi
     return None
 
 
+def detect_extracted_sheet_mapping(dataframe: pd.DataFrame) -> SheetMapping:
+    mapping = detect_sheet_mapping("Precatorios", dataframe)
+    if mapping is None:
+        raise ValueError("Nao foi possivel mapear a planilha automatica pelos cabecalhos esperados.")
+    return mapping
+
+
 def build_records(
     dataframe: pd.DataFrame,
     mapping: SheetMapping,
@@ -569,17 +576,7 @@ def run_validation(
 ) -> ValidationRunResult:
     manual_workbook = resolve_manual_workbook(manual_source)
     auto_df = pd.read_excel(auto_path)
-    auto_mapping = SheetMapping(
-        process_col=auto_df.columns[1],
-        precatorio_col=auto_df.columns[2],
-        name_col=auto_df.columns[3],
-        entity_col=auto_df.columns[4],
-        date_col=auto_df.columns[5],
-        type_col=auto_df.columns[6],
-        gross_col=auto_df.columns[7],
-        liquid_col=auto_df.columns[8],
-        nature_col=auto_df.columns[9],
-    )
+    auto_mapping = detect_extracted_sheet_mapping(auto_df)
     auto_records = build_records(auto_df, auto_mapping, "automatica", "Precatorios")
 
     sheet_name, _, manual_records = choose_manual_sheet(manual_workbook, auto_records, sheet)
@@ -722,6 +719,9 @@ def main() -> int:
             sheet=args.sheet,
         )
     except FileNotFoundError as exc:
+        print(str(exc))
+        return 1
+    except ValueError as exc:
         print(str(exc))
         return 1
 
